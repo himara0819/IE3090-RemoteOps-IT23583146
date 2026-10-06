@@ -5,10 +5,38 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <pthread.h>
+#include <signal.h>
+#include <time.h>
 #define PORT 9358
 
 #define SID "6413"
 #define AUTH_TOKEN "OPS-3146"
+
+#define LOG_FILE "remoteops_IT23583146.log"
+
+void write_log(const char *message)
+{
+    FILE *log = fopen(LOG_FILE, "a");
+
+    if (log == NULL)
+        return;
+
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+
+    fprintf(log,
+            "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
+            t->tm_year + 1900,
+            t->tm_mon + 1,
+            t->tm_mday,
+            t->tm_hour,
+            t->tm_min,
+            t->tm_sec,
+            message);
+
+    fclose(log);
+}
+
 /*read_line function*/
 ssize_t read_line(int fd, char *buffer, size_t max_length)
 {
@@ -271,6 +299,81 @@ void execute_command(const char *command,
     pclose(pipe);
 }
 
+typedef struct
+{
+    char controller_ip[INET_ADDRSTRLEN];
+    int udp_port;
+    volatile int running;
+} monitor_data_t;
+
+void *monitor_client(void *arg)
+{
+    monitor_data_t *monitor = (monitor_data_t *)arg;
+
+    int udp_fd;
+
+    struct sockaddr_in controller_addr;
+
+    udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (udp_fd < 0)
+    {
+        perror("UDP socket");
+        
+        return NULL;
+    }
+
+    memset(&controller_addr, 0, sizeof(controller_addr));
+
+    controller_addr.sin_family = AF_INET;
+    controller_addr.sin_port = htons(monitor->udp_port);
+
+    if (inet_pton(AF_INET,
+                  monitor->controller_ip,
+                  &controller_addr.sin_addr) <= 0)
+    {
+        perror("inet_pton");
+        close(udp_fd);
+        
+        return NULL;
+    }
+
+    while (monitor->running)
+    {
+        double cpu_load;
+        long mem_used_mb;
+        long uptime_sec;
+
+        get_sysinfo(&cpu_load,
+                    &mem_used_mb,
+                    &uptime_sec);
+
+        char message[256];
+
+        snprintf(message,
+                 sizeof(message),
+                 "SYSINFO %.2f %ld %ld SID:6413",
+                 cpu_load,
+                 mem_used_mb,
+                 uptime_sec);
+
+        sendto(udp_fd,
+               message,
+               strlen(message),
+               0,
+               (struct sockaddr *)&controller_addr,
+               sizeof(controller_addr));
+
+        sleep(2);
+    }
+
+    close(udp_fd);
+
+    
+
+    return NULL;
+}
+
 
 /*handle_client()*/
 void *handle_client(void *arg)
@@ -279,7 +382,15 @@ void *handle_client(void *arg)
 
     free(arg);
 
+    pthread_t monitor_thread;
+    monitor_data_t *monitor = NULL;
+    int monitoring = 0; 
+
+    
+
     printf("Controller connected!\n");
+
+    write_log("Controller connected");
 
     char buffer[1024];
     int authenticated = 0;
@@ -289,15 +400,33 @@ void *handle_client(void *arg)
      */
      while (1)
     {
+
+    printf("Waiting for next TCP command...\n");
+    fflush(stdout);
+
     ssize_t n = read_line(client_fd, buffer, sizeof(buffer));
 
     if (n <= 0)
+{
+    printf("Controller disconnected.\n");
+
+    if (monitoring)
     {
-        printf("Controller disconnected.\n");
-        break;
+        monitor->running = 0;
+
+        pthread_join(monitor_thread, NULL);
+
+        
+        monitor = NULL;
+
+        monitoring = 0;
     }
 
+    break;
+}
+
     printf("Received: %s", buffer);
+    write_log(buffer);
 
     /*
      * Authentication
@@ -338,18 +467,29 @@ void *handle_client(void *arg)
      * QUIT
      */
     if (strcmp(buffer, "QUIT\n") == 0)
+{
+    if (monitoring)
     {
-        char response[] =
-            "OK BYE SID:6413\n";
+        monitor->running = 0;
 
-        send(client_fd,
-             response,
-             strlen(response),
-             0);
+        pthread_join(monitor_thread, NULL);
 
-        break;
+        
+        monitor = NULL;
+
+        monitoring = 0;
     }
 
+    char response[] =
+        "OK BYE SID:6413\n";
+
+    send(client_fd,
+         response,
+         strlen(response),
+         0);
+
+    break;
+}
 	/*
  * SYSINFO command
  */
@@ -444,7 +584,7 @@ else if (strncmp(buffer, "EXEC ", 5) == 0)
  * PUT
  * ================================================= */
 
-if (strncmp(buffer, "PUT ", 4) == 0)
+else if (strncmp(buffer, "PUT ", 4) == 0)
 {
     char filename[256];
     long filesize;
@@ -568,29 +708,33 @@ if (strncmp(buffer, "PUT ", 4) == 0)
              0);
     }
     else
-    {
-        char response[512];
+{
+    char response[512];
 
-        snprintf(response,
-                 sizeof(response),
-                 "OK FILE_RECEIVED %s SID:%s\n",
-                 filename,
-                 SID);
+    snprintf(response,
+             sizeof(response),
+             "OK FILE_RECEIVED %s SID:%s\n",
+             filename,
+             SID);
 
-        send(client_fd,
-             response,
-             strlen(response),
-             0);
-    }
+    send(client_fd,
+         response,
+         strlen(response),
+         0);
 
-    continue;
+    printf("PUT completed successfully. Waiting for next command...\n");
+    write_log("PUT completed successfully: upload.txt");
+    fflush(stdout);
+}
+
+continue;
 }
 
 /* =================================================
  * GET
  * ================================================= */
 
-if (strncmp(buffer, "GET ", 4) == 0)
+else if (strncmp(buffer, "GET ", 4) == 0)
 {
     char filename[256];
 
@@ -688,6 +832,147 @@ if (strncmp(buffer, "GET ", 4) == 0)
     continue;
 }
 
+else if (strncmp(buffer, "MONITOR START ", 14) == 0)
+{
+    int udp_port;
+
+    if (sscanf(buffer, "MONITOR START %d", &udp_port) != 1)
+    {
+        char response[] =
+            "ERR 003 INVALID_MONITOR_PORT SID:6413\n";
+
+        send(client_fd,
+             response,
+             strlen(response),
+             0);
+
+        continue;
+    }
+
+    if (monitoring)
+    {
+        char response[] =
+            "ERR 003 MONITOR_ALREADY_RUNNING SID:6413\n";
+
+        send(client_fd,
+             response,
+             strlen(response),
+             0);
+
+        continue;
+    }
+
+    monitor = malloc(sizeof(monitor_data_t));
+
+    if (monitor == NULL)
+    {
+        char response[] =
+            "ERR 003 MONITOR_START_FAILED SID:6413\n";
+
+        send(client_fd,
+             response,
+             strlen(response),
+             0);
+
+        continue;
+    }
+
+    struct sockaddr_in peer_addr;
+    socklen_t peer_len = sizeof(peer_addr);
+
+    if (getpeername(client_fd,
+                    (struct sockaddr *)&peer_addr,
+                    &peer_len) < 0)
+    {
+        perror("getpeername");
+
+        
+        monitor = NULL;
+
+        char response[] =
+            "ERR 003 MONITOR_START_FAILED SID:6413\n";
+
+        send(client_fd,
+             response,
+             strlen(response),
+             0);
+
+        continue;
+    }
+
+    inet_ntop(AF_INET,
+              &peer_addr.sin_addr,
+              monitor->controller_ip,
+              sizeof(monitor->controller_ip));
+
+    monitor->udp_port = udp_port;
+    monitor->running = 1;
+
+    if (pthread_create(&monitor_thread,
+                       NULL,
+                       monitor_client,
+                       monitor) != 0)
+    {
+        perror("pthread_create");
+
+        free(monitor);
+        monitor = NULL;
+
+        char response[] =
+            "ERR 003 MONITOR_START_FAILED SID:6413\n";
+
+        send(client_fd,
+             response,
+             strlen(response),
+             0);
+
+        continue;
+    }
+
+    monitoring = 1;
+
+    char response[] =
+        "OK MONITOR_STARTED SID:6413\n";
+
+    send(client_fd,
+         response,
+         strlen(response),
+         0);
+}
+
+else if (strcmp(buffer, "MONITOR STOP\n") == 0)
+{
+    if (!monitoring)
+    {
+        char response[] =
+            "ERR 003 MONITOR_NOT_RUNNING SID:6413\n";
+
+        send(client_fd,
+             response,
+             strlen(response),
+             0);
+
+        continue;
+    }
+
+    monitor->running = 0;
+
+    pthread_join(monitor_thread, NULL);
+
+    free(monitor);
+    monitor = NULL;
+
+    monitoring = 0;
+
+    char response[] =
+        "OK MONITOR_STOPPED SID:6413\n";
+
+    send(client_fd,
+         response,
+         strlen(response),
+         0);
+}
+
 /*Unknown command*/
 else
 {
@@ -702,7 +987,7 @@ else
 
 /* End of while loop */
 }
-
+    write_log("Controller disconnected");
     close(client_fd);
 
     return NULL;

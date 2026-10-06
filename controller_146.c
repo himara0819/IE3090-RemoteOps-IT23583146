@@ -5,6 +5,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <pthread.h>
+#include <errno.h>
+#include <sys/time.h>
 
 #define PORT 9358
 
@@ -176,6 +179,62 @@ int send_command(int sockfd, const char *command)
     return 0;
 }
 
+/*
+ * ---------------------------------------------------------
+ * UDP MONITORING
+ * ---------------------------------------------------------
+ */
+
+typedef struct
+{
+    int udp_fd;
+    volatile int running;
+} udp_monitor_t;
+
+
+void *udp_monitor_receiver(void *arg)
+{
+    udp_monitor_t *monitor = (udp_monitor_t *)arg;
+
+    char buffer[256];
+
+    struct sockaddr_in agent_addr;
+    socklen_t agent_addr_len = sizeof(agent_addr);
+
+    while (monitor->running)
+    {
+        ssize_t n = recvfrom(monitor->udp_fd,
+                             buffer,
+                             sizeof(buffer) - 1,
+                             0,
+                             (struct sockaddr *)&agent_addr,
+                             &agent_addr_len);
+
+        if (n > 0)
+        {
+            buffer[n] = '\0';
+
+            printf("UDP Monitor: %s\n", buffer);
+        }
+        else if (n < 0)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                continue;
+            }
+
+            if (monitor->running)
+            {
+                perror("recvfrom");
+            }
+
+            break;
+        }
+    }
+
+    return NULL;
+}
+
 
 /*
  * ---------------------------------------------------------
@@ -187,6 +246,10 @@ int main(void)
     int sockfd;
 
     struct sockaddr_in server_addr;
+
+    udp_monitor_t monitor;
+    pthread_t monitor_thread;
+    
 
 
     /*
@@ -274,28 +337,55 @@ int main(void)
     }
 
 
-    /*
-     * =====================================================
-     * SYSINFO
-     * =====================================================
-     */
+   
+        /*
+    * =====================================================
+    * SYSINFO
+    * =====================================================
+    */
+
+    printf("\n--- SYSINFO ---\n");
+
+    if (send_command(sockfd, "SYSINFO\n") < 0)
+    {
+        printf("SYSINFO failed.\n");
+        close(sockfd);
+        return 1;
+    }
 
 
     /*
-     * =====================================================
-     * LISTPROC
-     * =====================================================
-     */
+    * =====================================================
+    * LISTPROC
+    * =====================================================
+    */
 
+    printf("\n--- LISTPROC ---\n");
+
+    if (send_command(sockfd, "LISTPROC\n") < 0)
+    {
+        printf("LISTPROC failed.\n");
+        close(sockfd);
+        return 1;
+    }
 
 
     /*
-     * =====================================================
-     * EXEC
-     * =====================================================
-     */
+    * =====================================================
+    * EXEC
+    * =====================================================
+    */
 
+    printf("\n--- EXEC ---\n");
 
+    if (send_command(sockfd, "EXEC DATE\n") < 0)
+    {
+        printf("EXEC failed.\n");
+        close(sockfd);
+        return 1;
+    }
+
+    
 
     /*
      * =====================================================
@@ -452,7 +542,7 @@ int main(void)
      *
      * Download upload.txt from the Agent.
      * =====================================================
-     */
+    
 
     const char *get_filename = "upload.txt";
 
@@ -464,9 +554,7 @@ int main(void)
              get_filename);
 
 
-    /*
-     * Send GET command.
-     */
+    
 
     if (send_all(sockfd,
                  get_command,
@@ -478,11 +566,7 @@ int main(void)
     }
 
 
-    /*
-     * Receive:
-     *
-     * OK FILE_SEND <filename> <filesize> SID:<sid>\n
-     */
+    
 
     char header[1024];
 
@@ -504,9 +588,7 @@ int main(void)
            header);
 
 
-    /*
-     * Extract filename and filesize.
-     */
+    
 
     char received_filename[256];
 
@@ -535,9 +617,7 @@ int main(void)
     }
 
 
-    /*
-     * Create local downloaded file.
-     */
+    
 
     FILE *downloaded_file =
         fopen("downloaded_upload.txt", "wb");
@@ -552,9 +632,7 @@ int main(void)
     }
 
 
-    /*
-     * Receive exactly 'filesize' bytes.
-     */
+    
 
     char download_buffer[4096];
 
@@ -623,19 +701,175 @@ int main(void)
            "downloaded_upload.txt\n");
 
 
-    /*
-     * =====================================================
-     * QUIT
-     * =====================================================
-     */
 
-    if (send_command(sockfd,
-                     "QUIT\n") < 0)
+
+   
+
+printf("UDP monitoring active for 10 seconds...\n");
+sleep(10);
+
+
+
+if (send_command(sockfd,
+                 "MONITOR STOP\n") < 0)
+{
+    monitor.running = 0;
+    pthread_join(monitor_thread, NULL);
+    close(monitor.udp_fd);
+    close(sockfd);
+    return 1;
+}
+
+
+
+monitor.running = 0;
+
+pthread_join(monitor_thread, NULL);
+
+close(monitor.udp_fd);
+
+
+
+printf("UDP monitoring stopped.\n"); */
+
+
+        /*
+    * =====================================================
+    * UDP MONITORING
+    * =====================================================
+    */
+
+    int udp_port = 9001;
+
+    struct sockaddr_in udp_addr;
+
+    monitor.udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (monitor.udp_fd < 0)
     {
+        perror("UDP socket");
         close(sockfd);
-
         return 1;
     }
+
+    memset(&udp_addr, 0, sizeof(udp_addr));
+
+    udp_addr.sin_family = AF_INET;
+    udp_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    udp_addr.sin_port = htons(udp_port);
+
+    if (bind(monitor.udp_fd,
+            (struct sockaddr *)&udp_addr,
+            sizeof(udp_addr)) < 0)
+    {
+        perror("UDP bind");
+        close(monitor.udp_fd);
+        close(sockfd);
+        return 1;
+    }
+
+    /*
+    * Set a receive timeout so the UDP thread
+    * can periodically check the running flag.
+    */
+
+    struct timeval timeout;
+
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+
+    if (setsockopt(monitor.udp_fd,
+                SOL_SOCKET,
+                SO_RCVTIMEO,
+                &timeout,
+                sizeof(timeout)) < 0)
+    {
+        perror("setsockopt");
+        close(monitor.udp_fd);
+        close(sockfd);
+        return 1;
+    }
+
+    monitor.running = 1;
+
+    /*
+    * Start UDP receiver thread.
+    */
+
+    if (pthread_create(&monitor_thread,
+                    NULL,
+                    udp_monitor_receiver,
+                    &monitor) != 0)
+    {
+        perror("pthread_create");
+        close(monitor.udp_fd);
+        close(sockfd);
+        return 1;
+    }
+
+    
+
+    /*
+    * Tell the Agent to start sending
+    * UDP monitoring packets.
+    */
+
+    char monitor_command[128];
+
+    snprintf(monitor_command,
+            sizeof(monitor_command),
+            "MONITOR START %d\n",
+            udp_port);
+
+    if (send_command(sockfd, monitor_command) < 0)
+    {
+        monitor.running = 0;
+        pthread_join(monitor_thread, NULL);
+        close(monitor.udp_fd);
+        close(sockfd);
+        return 1;
+    }
+        
+
+    /*
+ * =====================================================
+ * STOP UDP MONITORING
+ * =====================================================
+ */
+
+printf("UDP monitoring active for 10 seconds...\n");
+
+sleep(10);
+
+if (send_command(sockfd, "MONITOR STOP\n") < 0)
+{
+    monitor.running = 0;
+    pthread_join(monitor_thread, NULL);
+    close(monitor.udp_fd);
+    close(sockfd);
+    return 1;
+}
+
+monitor.running = 0;
+
+pthread_join(monitor_thread, NULL);
+
+close(monitor.udp_fd);
+
+printf("UDP monitoring stopped.\n");
+
+
+/*
+ * =====================================================
+ * QUIT
+ * =====================================================
+ */
+
+if (send_command(sockfd, "QUIT\n") < 0)
+{
+    close(sockfd);
+    return 1;
+}
 
 
     /*
