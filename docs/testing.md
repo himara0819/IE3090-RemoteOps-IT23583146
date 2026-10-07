@@ -35,9 +35,11 @@ The downloaded file was verified using:
 
 ```bash
 cmp upload.txt downloaded_upload.txt
+```
 
 The command produced no output, confirming byte-for-byte equality.
-UDP Verification
+
+## UDP Verification
 The Controller successfully received periodic datagrams such as:
 UDP Monitor: SYSINFO 0.68 1850 13368 SID:6413
 
@@ -46,7 +48,7 @@ Authentication Error Test
 An incorrect authentication token produced:
 ERR 001 AUTH_FAILED SID:6413
 
-Concurrency Test
+## Concurrency Test
 Five simultaneous TCP Controller connections were created.
 All five successfully authenticated and returned:
 OK AUTHENTICATED SID:6413
@@ -54,7 +56,7 @@ OK AUTHENTICATED SID:6413
 All five subsequently returned:
 OK BYE SID:6413
 
-Logging Verification
+## Logging Verification
 The following personalised log file was verified:
 remoteops_IT23583146.log
 
